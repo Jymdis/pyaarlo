@@ -108,6 +108,11 @@ class ArloCamera(ArloChildDevice):
         self._local_users = set()
         # what is triggered from elsewhere
         self._remote_users = set()
+        # Fork (issue #207): True only while a stream is known to be running,
+        # either because our startUserStream POST succeeded or because Arlo
+        # reported userStreamActive/alertStreamActive. A plain URL lookup
+        # (action "get") does not set it, so it never hides a stopped camera.
+        self._stream_active = False
 
     def _parse_statistic(self, data, scale):
         """Parse binary statistics returned from the history API"""
@@ -308,6 +313,7 @@ class ArloCamera(ArloChildDevice):
             self._local_users = set()
             self._remote_users = set()
             self._stream_url = None
+            self._stream_active = False
             self._dump_activities("_event::idle")
             self._lock.notify_all()
 
@@ -356,11 +362,10 @@ class ArloCamera(ArloChildDevice):
             if response is not None else None
         )
         if stream_url is not None:
-            if not self.has_any_local_users:
-                with self._lock:
-                    self._local_users.add(starting_for)
-                    self._dump_activities("_get_stream_url")
-
+            # Fork (issue #207): a URL lookup does not start the camera, so it
+            # must not register a local user. Doing so made the next start
+            # return this URL without POSTing startUserStream, and a later
+            # takeSnapshot failed with 2503 "Camera is not streaming".
             self.debug("url={}".format(stream_url))
         else:
             self.debug(f"No stream url for {self.name}")
@@ -374,7 +379,9 @@ class ArloCamera(ArloChildDevice):
     def _start_stream_locked(self, starting_for, user_agent=None):
         with self._lock:
             # Already streaming. Update sub-activity as needed.
-            if self.has_any_local_users:
+            # Fork (issue #207): only reuse the URL when a stream is confirmed
+            # active; leftover local users alone are not proof of a stream.
+            if self._stream_active and self._stream_url is not None:
                 self._local_users.add(starting_for)
                 self._dump_activities("_start_stream")
                 return self._stream_url
@@ -413,6 +420,9 @@ class ArloCamera(ArloChildDevice):
                 self._stream_url = stream_url
                 if stream_url is None:
                     self._local_users.discard(starting_for)
+                else:
+                    # Fork (issue #207): we started it, so it is active.
+                    self._stream_active = True
         return stream_url
 
     def _stop_stream(self, stopping_for="streaming"):
@@ -497,6 +507,7 @@ class ArloCamera(ArloChildDevice):
                     self._remote_users.add("recording")
                     if not self.has_any_local_users:
                         self._local_users.add("remote")
+                self._stream_active = True
                 self._lock.notify_all()
                 self._dump_activities("_event::record")
         if activity == "userStreamActive":
@@ -505,6 +516,7 @@ class ArloCamera(ArloChildDevice):
                     self._remote_users.add("streaming")
                     if not self.has_any_local_users:
                         self._local_users.add("remote")
+                self._stream_active = True
                 self._lock.notify_all()
                 self._dump_activities("_event::stream")
 
@@ -857,7 +869,23 @@ class ArloCamera(ArloChildDevice):
         with self._lock:
             if self.has_user_request("snapshot"):
                 return
-            stream_snapshot = self.has_any_local_users
+            # Fork (issue #207): takeSnapshot needs a live stream, so decide on
+            # a confirmed stream rather than on registered local users.
+            stream_snapshot = self._stream_active
+
+        # Fork (issue #207): when stream snapshots are configured and nothing
+        # is streaming yet, start a stream first instead of sending
+        # takeSnapshot to an idle camera.
+        started_here = False
+        if not stream_snapshot and self._arlo.cfg.stream_snapshot:
+            started_here = self._start_stream("snapshot") is not None
+            stream_snapshot = started_here
+
+        with self._lock:
+            if self.has_user_request("snapshot"):
+                if started_here:
+                    self._arlo.bg.run(self._stop_stream, stopping_for="snapshot")
+                return
             self._user_requests.add("snapshot")
             self._dump_activities("request_snapshot")
             snapshot_running = self.has_remote_user("snapshot")
@@ -953,6 +981,16 @@ class ArloCamera(ArloChildDevice):
     @property
     def has_any_local_users(self):
         return len(self._local_users) != 0
+
+    @property
+    def is_stream_active(self):
+        """Returns `True` while a stream is known to be running (fork, #207).
+
+        Set when our startUserStream request succeeded or Arlo reported
+        userStreamActive/alertStreamActive (for example a doorbell press),
+        cleared when the camera goes idle.
+        """
+        return self._stream_active
 
     def has_remote_user(self, activity):
         return activity in self._remote_users

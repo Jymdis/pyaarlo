@@ -1,0 +1,116 @@
+# Fork: keep lp/main close to upstream without ever changing it on its own.
+# Weekly (and on demand) this merges upstream/master into a copy of lp/main on
+# branch sync/upstream and opens or updates a pull request into lp/main.
+# On a merge conflict it opens an issue instead (or fails the run, with the
+# conflicting files in the summary, when issues are disabled). Nothing is
+# merged automatically and lp/main is never pushed to.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: twrecked/pyaarlo
+  UPSTREAM_BRANCH: master
+  BASE_BRANCH: lp/main
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out lp/main
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Merge upstream into sync/upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --tags upstream "${UPSTREAM_BRANCH}"
+          upstream_sha=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          upstream_tag=$(git describe --tags --abbrev=0 "upstream/${UPSTREAM_BRANCH}" 2>/dev/null || echo "none")
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=${upstream_tag}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${upstream_sha}" HEAD; then
+            echo "lp/main already contains upstream ${upstream_tag} (${upstream_sha})." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "result=uptodate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout -B "${SYNC_BRANCH}"
+          if git merge --no-ff --no-edit -m "Merge upstream ${UPSTREAM_REPO}@${upstream_tag} into ${BASE_BRANCH}" "${upstream_sha}"; then
+            # Only the bot's own sync branch is force-pushed, never lp/main.
+            git push --force origin "${SYNC_BRANCH}"
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "conflicts<<EOF_CONFLICTS"
+              git diff --name-only --diff-filter=U
+              echo "EOF_CONFLICTS"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the pull request
+        if: steps.merge.outputs.result == 'merged'
+        env:
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          UPSTREAM_TAG: ${{ steps.merge.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          title="Sync with upstream ${UPSTREAM_REPO} ${UPSTREAM_TAG}"
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Merges upstream \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` (${UPSTREAM_TAG}, ${UPSTREAM_SHA}) into \`${BASE_BRANCH}\`." \
+            "Review the fork changes listed in the README's Fork notice, run the tests, bump the fork version and release after merging." \
+            "Opened by the sync-upstream workflow. It is never merged automatically.")
+          number=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "${number}" ]; then
+            gh pr edit "${number}" --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+            echo "Updated pull request #${number}." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            gh pr create --repo "${GITHUB_REPOSITORY}" --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --title "${title}" --body "${body}"
+            echo "Opened a pull request into ${BASE_BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Report a merge conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          UPSTREAM_TAG: ${{ steps.merge.outputs.upstream_tag }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync conflict: ${UPSTREAM_REPO} ${UPSTREAM_TAG}"
+          body=$(printf '%s\n\n%s\n\n```\n%s\n```\n\n%s\n' \
+            "Merging upstream \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` (${UPSTREAM_TAG}, ${UPSTREAM_SHA}) into \`${BASE_BRANCH}\` conflicts." \
+            "Conflicting files:" "${CONFLICTS}" \
+            "Merge by hand on a branch and open a pull request into \`${BASE_BRANCH}\`. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+          printf '%s\n\n%s\n' "## ${title}" "${body}" >> "$GITHUB_STEP_SUMMARY"
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "\"Upstream sync conflict\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          elif ! gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"; then
+            echo "::error::Upstream merge conflicts and issues are disabled; see the run summary."
+            exit 1
+          fi

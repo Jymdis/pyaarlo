@@ -23,9 +23,11 @@ def camera():
 
 
 @pytest.mark.parametrize("cached", [None, "rtsps://example.invalid/expired"])
-@pytest.mark.parametrize("method,user", [("get_stream", "streaming"),
-                                        ("get_stream_url", "remote")])
-def test_concurrent_starts_wait_for_the_current_source(camera, cached, method, user):
+# Fork (issue #207): a get_stream_url lookup registers no local user and does
+# not start the camera, so the following start POSTs startUserStream itself.
+@pytest.mark.parametrize("method,user,posts", [("get_stream", "streaming", 1),
+                                              ("get_stream_url", None, 2)])
+def test_concurrent_starts_wait_for_the_current_source(camera, cached, method, user, posts):
     entered, release, second_entered = Event(), Event(), Event()
     camera._stream_url = cached
 
@@ -52,8 +54,9 @@ def test_concurrent_starts_wait_for_the_current_source(camera, cached, method, u
             release.set()
         assert first.result(2) == "rtsps://example.invalid/current"
         assert second.result(2) == "rtsps://example.invalid/current"
-    assert camera._arlo.be.post.call_count == 1
-    assert camera.has_local_user(user)
+    assert camera._arlo.be.post.call_count == posts
+    if user is not None:
+        assert camera.has_local_user(user)
     assert camera.has_local_user("snapshot")
 
 

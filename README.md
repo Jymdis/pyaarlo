@@ -1,5 +1,36 @@
 # Pyaarlo
 
+## Fork notice
+
+This is a fork of [twrecked/pyaarlo](https://github.com/twrecked/pyaarlo),
+maintained at [Jymdis/pyaarlo](https://github.com/Jymdis/pyaarlo) for use with
+[Jymdis/hass-aarlo](https://github.com/Jymdis/hass-aarlo). It is released
+under the same licence as upstream, the GNU LGPL v3 (see [LICENSE](LICENSE));
+the original copyright and authorship are unchanged. Branch `lp/main` starts
+at upstream tag `v0.8.0.27`.
+
+Changes in this fork (version `0.8.0.27.post1`):
+
+- **Snapshots on cameras that are not streaming** (upstream issue
+  [#207](https://github.com/twrecked/pyaarlo/issues/207)). A stream URL lookup
+  (`get_stream_url`, action `get`) used to register a local user although it
+  does not start the camera. The next stream start then returned the stale URL
+  without POSTing `startUserStream`, and `request_snapshot` chose
+  `takeSnapshot`, which Arlo rejects with error 2503 "Camera is not streaming".
+  Now a URL lookup registers no local user, `startUserStream` is POSTed unless
+  a stream is confirmed active (our own start succeeded, or Arlo reported
+  `userStreamActive`/`alertStreamActive`), and `takeSnapshot` is used only
+  while a stream is confirmed active; otherwise a stream is started first
+  (when `stream_snapshot` is set) or an idle snapshot is taken. The new
+  property `ArloCamera.is_stream_active` exposes that state. Tested with
+  `tests/test_issue_207.py`.
+
+Install this version with
+`pip install https://github.com/Jymdis/pyaarlo/archive/refs/tags/v0.8.0.27.post1.tar.gz`.
+A weekly workflow opens a pull request when upstream moves on; it never merges
+on its own.
+
+
 ### Breaking Changes
 
 #### Trusted Browser Support
