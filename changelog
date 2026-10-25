@@ -1,3 +1,24 @@
+0.8.0.27.post2 (fork: Jymdis/pyaarlo)
+  Bug Fixes
+  - Event stream went silent after a re-login: REST recovered from a 401 but
+    the MQTT stream kept (or reconnected with) the old token, so doorbell and
+    motion events stopped while the integration looked healthy. pyaarlo now
+    runs the MQTT network loop itself, so a restart request is always honoured
+    and every reconnect uses the current token.
+  - Scheduled reconnect never ran: Arlo's expiresIn is an epoch time, not a
+    duration, so the default interval came out as ~1.8e9 seconds. Default is
+    now 90 minutes, or 5 minutes before the token expires if sooner.
+  New
+  - Stream watchdog (every minute): restarts the event stream when it still
+    uses a token replaced by a re-login, has been disconnected for 90 s, or has
+    carried no traffic for `stream_watchdog_minutes` (default 15, 0 = off; the
+    limit doubles after each fruitless restart, up to 8x). Restarts are logged
+    at WARNING with the reason.
+  - MQTT subscriptions: one-line topic summary on every (re)connect, a
+    WARNING when the device list has no allowedMqttTopics (device events such
+    as doorbell presses would then never arrive) and when the broker refuses a
+    subscription.
+
 0.8.0.27.post1 (fork: Jymdis/pyaarlo)
   Bug Fixes
   - Snapshot "Camera is not streaming" (upstream issue #207): a stream URL

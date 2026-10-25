@@ -93,6 +93,7 @@ class TestBackendReauth(TestCase):
         backend._reconnect_job = None
         backend._mqtt_reconnect_attempts = 0
         backend._user_id = "user123"
+        backend._use_mqtt = True
         return backend
 
     def test_request_tuple_retries_on_401_after_successful_relogin(self):
@@ -254,7 +255,7 @@ class TestBackendReauth(TestCase):
         backend._select_backend = MagicMock()
         backend._event_main = MagicMock()
         backend._use_mqtt = True
-        backend._expires_in = 7200
+        backend._expires_in = 3600
 
         def fake_start():
             backend._event_connected = True
@@ -266,7 +267,7 @@ class TestBackendReauth(TestCase):
             backend.start_monitoring()
 
         self.assertIsNotNone(backend._reconnect_job)
-        self.assertEqual(backend._reconnect_job["seconds"], 6900)
+        self.assertEqual(backend._reconnect_job["seconds"], 3300)
 
     def test_stop_cancels_reconnect_job(self):
         backend = self._create_backend()

@@ -9,7 +9,21 @@ under the same licence as upstream, the GNU LGPL v3 (see [LICENSE](LICENSE));
 the original copyright and authorship are unchanged. Branch `lp/main` starts
 at upstream tag `v0.8.0.27`.
 
-Changes in this fork (version `0.8.0.27.post1`):
+Changes in this fork (version `0.8.0.27.post2`):
+
+- **Event stream goes silent after a re-login** (0.8.0.27.post2). After a
+  REST call got 401 and pyaarlo logged in again, the MQTT event stream could
+  keep running on, or reconnect with, the old token: library polling still
+  worked but doorbell presses and motion never arrived. The MQTT network loop
+  is now run by pyaarlo instead of paho's `loop_forever()`, so a restart is
+  always honoured and reconnects use the current token. A watchdog restarts the
+  stream when it still uses a replaced token, stays disconnected for 90 s, or
+  carries no traffic for `stream_watchdog_minutes` (default 15, `0` turns that
+  check off). The default `reconnect_every` now really runs every 90 minutes
+  (Arlo's `expiresIn` is an epoch time and used to disable it). Tested with
+  `tests/test_stream_watchdog.py`. Every (re)connect subscribes again and logs
+  how many device topics it got; a device list without `allowedMqttTopics`, or
+  a subscription the broker refuses, is logged as a warning.
 
 - **Snapshots on cameras that are not streaming** (upstream issue
   [#207](https://github.com/twrecked/pyaarlo/issues/207)). A stream URL lookup
@@ -26,7 +40,7 @@ Changes in this fork (version `0.8.0.27.post1`):
   `tests/test_issue_207.py`.
 
 Install this version with
-`pip install https://github.com/Jymdis/pyaarlo/archive/refs/tags/v0.8.0.27.post1.tar.gz`.
+`pip install https://github.com/Jymdis/pyaarlo/archive/refs/tags/v0.8.0.27.post2.tar.gz`.
 A weekly workflow opens a pull request when upstream moves on; it never merges
 on its own.
 
@@ -426,7 +440,11 @@ the top and work down:
   good starting point is 180 seconds.
 * `reconnect_every`, tell Pyaarlo to logout and back in every so often. This
   establishes a new session at the risk of losing an event notification. The
-  value is minutes and a good starting point is 90.
+  value is minutes and a good starting point is 90. At `0` (the default) it
+  runs every 90 minutes, or 5 minutes before the token expires if sooner.
+* `stream_watchdog_minutes`, restart the event stream when nothing at all has
+  arrived on it for this many minutes. The default is 15; `0` turns the idle
+  check off.
 * `request_timeout`, the amount of time to allow for a http request to work. A
   good starting point is 120 seconds.
 * `extra_device_states`, a list of additional device `state` values to accept on

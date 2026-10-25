@@ -206,6 +206,13 @@ class ArloCfg(object):
         return self._kw.get("reconnect_every", 0) * 60
 
     @property
+    def stream_watchdog(self):
+        """Seconds without any event-stream traffic before the stream is
+        restarted (``stream_watchdog_minutes``, default 15; 0 turns the idle
+        check off)."""
+        return self._kw.get("stream_watchdog_minutes", 15) * 60
+
+    @property
     def snapshot_timeout(self):
         return self._kw.get("snapshot_timeout", 60)
 

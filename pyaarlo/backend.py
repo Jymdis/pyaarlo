@@ -97,6 +97,14 @@ def _flatten_intelligence_events(grouped, location_id):
     return records
 
 
+# Event stream health (see _event_watchdog).
+WATCHDOG_INTERVAL = 60             # how often the watchdog looks, seconds
+WATCHDOG_DISCONNECTED_LIMIT = 90   # disconnected this long without coming back -> restart
+WATCHDOG_MAX_IDLE_BACKOFF = 8      # idle limit doubles per fruitless restart, up to 8x
+MQTT_RECONNECT_MAX_WAIT = 30       # cap for our own MQTT reconnect back-off, seconds
+DEFAULT_RECONNECT_EVERY = 90 * 60  # scheduled re-login when reconnect_every is 0
+
+
 class ArloBackEnd(object):
 
     _session_lock = threading.Lock()
@@ -139,6 +147,15 @@ class ArloBackEnd(object):
         self._is_logging_in = False
         self._reconnect_job = None
         self._mqtt_reconnect_attempts = 0
+
+        # event stream health, see _event_watchdog()
+        self._event_restart_reason = None
+        self._event_restart_relogin = True
+        self._event_token = None
+        self._last_event_time = time.monotonic()
+        self._event_disconnected_at = None
+        self._watchdog_job = None
+        self._watchdog_idle_restarts = 0
 
         # login
         self._session = None
@@ -693,11 +710,19 @@ class ArloBackEnd(object):
                 self.debug("re-logging in")
                 self._logged_in = self._login()
 
+            started = time.monotonic()
             if self._use_mqtt:
                 self._mqtt_main()
             else:
                 self._sse_main()
             self.debug("exited the event loop")
+
+            # Was this a requested restart, and does it need a new login? A
+            # watchdog restart or a restart after a re-login only reconnects
+            # with the current token; anything else logs in again as before.
+            relogin = getattr(self, "_event_restart_relogin", True)
+            self._event_restart_reason = None
+            self._event_restart_relogin = True
 
             # clear down and signal out
             with self._lock:
@@ -707,13 +732,21 @@ class ArloBackEnd(object):
 
             # restart login...
             self._event_client = None
-            login_lock = getattr(self, "_login_lock", None)
-            if login_lock is not None:
-                with login_lock:
-                    if time.monotonic() - getattr(self, "_last_login_time", 0) >= 10:
-                        self._logged_in = False
+            if not relogin:
+                self.debug("reconnecting the event stream with the current token")
             else:
-                self._logged_in = False
+                login_lock = getattr(self, "_login_lock", None)
+                if login_lock is not None:
+                    with login_lock:
+                        if time.monotonic() - getattr(self, "_last_login_time", 0) >= 10:
+                            self._logged_in = False
+                else:
+                    self._logged_in = False
+
+            # Don't spin if the stream fails straight away (DNS, refused...).
+            if not self._stop_thread and time.monotonic() - started < 5:
+                with self._lock:
+                    self._lock.wait(5)
 
     def _mqtt_topics(self):
         topics = set()
@@ -724,9 +757,33 @@ class ArloBackEnd(object):
 
     def _mqtt_subscribe(self):
         # Make sure we are listening to user events and individual device events.
-        topics = [(f"u/{self._user_id}/in/#", 0)] + self._mqtt_topics()
+        # Called from on_connect, so every (re)connect subscribes again, with
+        # the topics of the current device list.
+        device_topics = self._mqtt_topics()
+        topics = [(f"u/{self._user_id}/in/#", 0)] + device_topics
+        self.debug(f"mqtt: subscribing to {len(topics)} topics "
+                   f"({len(device_topics)} from allowedMqttTopics)")
         self.debug("topics=\n{}".format(pprint.pformat(topics)))
+        if not device_topics and not getattr(self, "_warned_no_topics", False):
+            # Device events (doorbell presses, motion) are expected on the
+            # device topics; say so once if Arlo sent none.
+            self._warned_no_topics = True
+            self._arlo.warning("mqtt: the device list has no allowedMqttTopics, "
+                               "device events may not arrive")
+        self._event_topics = topics
         self._event_client.subscribe(topics)
+
+    def _mqtt_on_subscribe(self, _client, _userdata, _mid, granted_qos, *args):
+        # MQTT 3.1.1 answers 128 for a topic the broker refused.
+        granted = list(granted_qos) if isinstance(granted_qos, (list, tuple)) else [granted_qos]
+        topics = getattr(self, "_event_topics", [])
+        refused = [topics[i][0] if i < len(topics) else str(i)
+                   for i, qos in enumerate(granted)
+                   if int(getattr(qos, "value", qos)) >= 128]
+        if refused:
+            self._arlo.warning(f"mqtt: broker refused subscriptions: {refused}")
+        else:
+            self.debug(f"mqtt: subscribed, granted={[int(getattr(q, 'value', q)) for q in granted]}")
 
     def _mqtt_on_connect(self, _client, _userdata, _flags, rc, *args):
         # Subscribing in on_connect() means that if we lose the connection and
@@ -734,21 +791,25 @@ class ArloBackEnd(object):
         self.debug(f"mqtt: connected={str(rc)}")
         if rc == 0:
             self._mqtt_reconnect_attempts = 0
+            self._event_disconnected_at = None
+            self._note_event_traffic()
             self._mqtt_subscribe()
             with self._lock:
                 self._event_connected = True
                 self._lock.notify_all()
             self._arlo.bg.run(self.devices)
+            # A re-login can land while we were connecting with the old token.
+            event_token = getattr(self, "_event_token", None)
+            if event_token is not None and event_token != self._token:
+                self._event_reconnect("connected with a token replaced by a re-login",
+                                      relogin=False, warn=True)
         else:
+            # Usually bad credentials (rc 4/5): restart with a fresh login.
             self._arlo.warning(f"mqtt: connection rejected with code {rc}")
             with self._lock:
                 self._event_connected = False
                 self._lock.notify_all()
-            if self._event_client is not None:
-                try:
-                    self._event_client.disconnect()
-                except Exception:
-                    pass
+            self._event_reconnect(f"mqtt connection rejected with code {rc}", relogin=True)
 
     def _mqtt_on_disconnect(self, _client, _userdata, *args):
         rc = args[0] if args else 0
@@ -756,21 +817,19 @@ class ArloBackEnd(object):
         with self._lock:
             self._event_connected = False
             self._lock.notify_all()
+        if getattr(self, "_event_disconnected_at", None) is None:
+            self._event_disconnected_at = time.monotonic()
         if rc != 0:
             self._mqtt_reconnect_attempts = getattr(self, "_mqtt_reconnect_attempts", 0) + 1
             if self._mqtt_reconnect_attempts >= 3:
-                self.debug("multiple unexpected mqtt disconnects, forcing re-login")
-                if self._event_client is not None:
-                    try:
-                        self._event_client.disconnect()
-                    except Exception:
-                        pass
+                self._event_reconnect("multiple unexpected mqtt disconnects", relogin=True, warn=True)
 
     def _mqtt_on_log(self, _client, _userdata, _level, msg):
         self.vdebug(f"mqtt: log={str(msg)}")
 
     def _mqtt_on_message(self, _client, _userdata, msg):
         self.debug(f"mqtt: topic={msg.topic}")
+        self._note_event_traffic()
         try:
             response = json.loads(msg.payload.decode("utf-8"))
 
@@ -816,6 +875,7 @@ class ArloBackEnd(object):
             self._event_client.on_connect = self._mqtt_on_connect
             self._event_client.on_disconnect = self._mqtt_on_disconnect
             self._event_client.on_message = self._mqtt_on_message
+            self._event_client.on_subscribe = self._mqtt_on_subscribe
             ssl_context = ssl.create_default_context()
             if not self._arlo.cfg.mqtt_hostname_check:
                 ssl_context.check_hostname = False
@@ -823,6 +883,8 @@ class ArloBackEnd(object):
             else:
                 ssl_context.check_hostname = True
             self._event_client.tls_set_context(ssl_context)
+            # The token is the MQTT password; remember which one this client uses.
+            self._event_token = self._token
             self._event_client.username_pw_set(f"{self._user_id}", self._token)
             if self._arlo.cfg.mqtt_transport == "websockets":
                 self._event_client.ws_set_options(path=MQTT_PATH, headers=headers)
@@ -832,7 +894,7 @@ class ArloBackEnd(object):
 
             # Connect.
             self._event_client.connect(self._arlo.cfg.mqtt_host, port=self._arlo.cfg.mqtt_port, keepalive=60)
-            self._event_client.loop_forever()
+            self._mqtt_loop(self._event_client)
 
         except Exception as e:
             # self._arlo.warning('general exception ' + str(e))
@@ -842,12 +904,110 @@ class ArloBackEnd(object):
                 )
             )
 
+    def _mqtt_loop(self, client):
+        """Run the paho network loop until a restart is requested.
+
+        This replaces loop_forever(). paho's own reconnect reuses the
+        username/password it was given at start, i.e. the token from before
+        any re-login, and a disconnect() requested from another thread can
+        be lost while paho is between reconnect attempts. Here a restart
+        request is checked every second, and every reconnect uses the
+        current token.
+        """
+        wait = 1
+        while not self._stop_thread and getattr(self, "_event_restart_reason", None) is None:
+            rc = client.loop(timeout=1.0)
+            if rc == mqtt.MQTT_ERR_SUCCESS:
+                wait = 1
+                continue
+            if self._stop_thread or getattr(self, "_event_restart_reason", None) is not None:
+                break
+            self.debug(f"mqtt: loop rc={rc}, reconnecting in {wait}s")
+            with self._lock:
+                self._lock.wait(wait)
+            wait = min(wait * 2, MQTT_RECONNECT_MAX_WAIT)
+            if self._stop_thread or getattr(self, "_event_restart_reason", None) is not None:
+                break
+            try:
+                self._event_token = self._token
+                client.username_pw_set(f"{self._user_id}", self._token)
+                client.reconnect()
+            except Exception as e:
+                self.debug(f"mqtt: reconnect failed: {e}")
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+    def _note_event_traffic(self):
+        """Anything arrived on the event stream: it is alive."""
+        self._last_event_time = time.monotonic()
+        self._watchdog_idle_restarts = 0
+
+    def _event_watchdog(self):
+        """Restart an event stream that looks connected but delivers nothing.
+
+        Runs every WATCHDOG_INTERVAL seconds from the background thread.
+        With base stations there is traffic at least every minute (the ping
+        replies), so a long silence means the stream is half-dead. On a
+        quiet account the idle limit doubles after each restart that brought
+        no traffic (up to WATCHDOG_MAX_IDLE_BACKOFF times).
+        """
+        if self._stop_thread or self._event_client is None:
+            return
+        now = time.monotonic()
+        disconnected_at = getattr(self, "_event_disconnected_at", None)
+        backoff = min(2 ** getattr(self, "_watchdog_idle_restarts", 0), WATCHDOG_MAX_IDLE_BACKOFF)
+        idle_limit = self._arlo.cfg.stream_watchdog * backoff
+        idle = now - getattr(self, "_last_event_time", now)
+        event_token = getattr(self, "_event_token", None)
+
+        if self._use_mqtt and event_token is not None and event_token != self._token:
+            reason = "the event stream still uses the token from before the last re-login"
+        elif self._use_mqtt and disconnected_at is not None and now - disconnected_at > WATCHDOG_DISCONNECTED_LIMIT:
+            reason = f"mqtt disconnected for {int(now - disconnected_at)}s without reconnecting"
+        elif idle_limit > 0 and idle > idle_limit:
+            reason = f"no event stream traffic for {int(idle // 60)} minutes"
+            self._watchdog_idle_restarts = getattr(self, "_watchdog_idle_restarts", 0) + 1
+            # Restart the clock so a quiet account isn't restarted every minute.
+            self._last_event_time = now
+        else:
+            self.vdebug(f"watchdog: stream ok, idle {int(idle)}s")
+            return
+        self._event_disconnected_at = None
+        self._event_reconnect(reason, relogin=False, warn=True)
+
+    def _token_seconds_left(self):
+        """Seconds until the auth token expires, or None if unknown.
+
+        Arlo sends expiresIn as an epoch time (seconds, or milliseconds),
+        not a duration; plain small numbers are treated as a duration.
+        """
+        expires = self._expires_in
+        if not expires:
+            return None
+        if expires > 1e12:
+            expires = expires / 1000
+        if expires > 1e9:
+            return expires - time.time()
+        return expires
+
     def _sse_reconnected(self):
         self.debug("fetching device list after ev-reconnect")
         self.devices()
 
-    def _event_reconnect(self):
-        self.debug("trying to reconnect")
+    def _event_reconnect(self, reason="scheduled reconnect", relogin=True, warn=False):
+        """Tear down the event stream; _event_main() starts a new one.
+
+        relogin=False reconnects with the current token (after a re-login,
+        or from the watchdog); otherwise _event_main() logs in again first.
+        """
+        if warn:
+            self._arlo.warning(f"restarting event stream: {reason}")
+        else:
+            self.debug(f"trying to reconnect: {reason}")
+        self._event_restart_reason = reason
+        self._event_restart_relogin = relogin
         if self._event_client is not None:
             if self._use_mqtt:
                 try:
@@ -894,6 +1054,7 @@ class ArloBackEnd(object):
                 if event is None:
                     self.debug("reopening: no event")
                     break
+                self._note_event_traffic()
 
                 # dig out response
                 try:
@@ -966,16 +1127,24 @@ class ArloBackEnd(object):
                 count += 1
 
         # start reconnect daemon
+        # Default: every 90 minutes, or 5 minutes before the token expires if
+        # that is sooner (never more often than every 10 minutes). expiresIn
+        # used to be taken as a duration, but Arlo sends an epoch time, which
+        # gave "reconnecting every 1792957343s", i.e. never.
         reconnect_interval = self._arlo.cfg.reconnect_every
         if reconnect_interval == 0:
-            if self._expires_in and self._expires_in > 600:
-                reconnect_interval = self._expires_in - 300
-            else:
-                reconnect_interval = 90 * 60
+            reconnect_interval = DEFAULT_RECONNECT_EVERY
+            left = self._token_seconds_left()
+            if left is not None:
+                reconnect_interval = int(max(600, min(left - 300, DEFAULT_RECONNECT_EVERY)))
 
         if reconnect_interval != 0:
             self.debug(f"automatically reconnecting every {reconnect_interval}s")
             self._reconnect_job = self._arlo.bg.run_every(self._event_reconnect, reconnect_interval)
+
+        # start the stream watchdog
+        self._last_event_time = time.monotonic()
+        self._watchdog_job = self._arlo.bg.run_every(self._event_watchdog, WATCHDOG_INTERVAL)
 
         self.debug("stream up")
         return True
@@ -1353,7 +1522,8 @@ class ArloBackEnd(object):
                 return True
             self.debug("re-logging in after 401 or token expiration")
             if self._login():
-                self._event_reconnect()
+                # REST now uses the new token; the event stream must follow.
+                self._event_reconnect("token refreshed by re-login", relogin=False, warn=True)
                 return True
             return False
 
@@ -1479,6 +1649,9 @@ class ArloBackEnd(object):
         if getattr(self, "_reconnect_job", None) is not None:
             self._arlo.bg.cancel(self._reconnect_job)
             self._reconnect_job = None
+        if getattr(self, "_watchdog_job", None) is not None:
+            self._arlo.bg.cancel(self._watchdog_job)
+            self._watchdog_job = None
         self._event_stop_loop()
         if self._event_client is not None:
             try:
