@@ -1,3 +1,11 @@
+0.8.0.27.post3 (fork: Jymdis/pyaarlo)
+  - A failed request now logs why at warning level: method, path (no query),
+    HTTP status and Arlo's error/code/message/reason fields. Headers, URLs and
+    tokens are never logged. Before, a non-200 reply was dropped silently, so a
+    refused startUserStream during a doorbell press left no trace.
+  - startUserStream that answers without a url logs the keys it got and
+    returns None instead of raising KeyError.
+
 0.8.0.27.post2 (fork: Jymdis/pyaarlo)
   Bug Fixes
   - Event stream went silent after a re-login: REST recovered from a 401 but

@@ -105,6 +105,30 @@ MQTT_RECONNECT_MAX_WAIT = 30       # cap for our own MQTT reconnect back-off, se
 DEFAULT_RECONNECT_EVERY = 90 * 60  # scheduled re-login when reconnect_every is 0
 
 
+def _error_summary(body):
+    """Fork: Arlo's error code, message and reason from a failed response.
+
+    Only these short fields are kept (truncated), so tokens or URLs elsewhere
+    in a body never reach the log.
+    """
+    if not isinstance(body, dict):
+        return ""
+    fields = []
+    sources = [body]
+    for key in ("data", "meta"):
+        if isinstance(body.get(key), dict):
+            sources.append(body[key])
+    for src in sources:
+        for key in ("error", "code", "message", "reason"):
+            value = src.get(key)
+            if value is not None and not isinstance(value, (dict, list)):
+                text = str(value)
+                if "://" in text:
+                    continue
+                fields.append(f"{key}={text[:80]}")
+    return (" (" + ", ".join(fields) + ")") if fields else ""
+
+
 class ArloBackEnd(object):
 
     _session_lock = threading.Lock()
@@ -339,6 +363,13 @@ class ArloBackEnd(object):
             return r.status_code if r.status_code != 200 else 500, None
 
         self.vdebug("request-end={}".format(r.status_code))
+        if r.status_code != 200 and r.status_code != 401:
+            # Fork: say why a request failed. Only the method, the path (no
+            # query), the HTTP status and Arlo's own error fields; never
+            # headers, URLs or tokens.
+            self._arlo.warning(
+                f"request {method} {path.split('?')[0]} returned HTTP {r.status_code}{_error_summary(body)}"
+            )
         if r.status_code != 200:
             if r.status_code == 401 and not authpost and retry_401 and not getattr(self, "_is_logging_in", False):
                 self._arlo.warning(f"request returned 401 Unauthorized for {path}, attempting re-login and retry")
@@ -362,6 +393,7 @@ class ArloBackEnd(object):
             return 200, body
 
         if not isinstance(body, dict):
+            self._arlo.warning(f"request {method} {path.split('?')[0]}: response is not a JSON object")
             return 500, None
 
         # New auth style and TFA helper
@@ -400,6 +432,8 @@ class ArloBackEnd(object):
                 return 200, {}
             else:
                 self._arlo.warning("error in response=" + str(body))
+        else:
+            self._arlo.warning(f"request {method} {path.split('?')[0]}: unexpected response without success or meta")
 
         return 500, None
 

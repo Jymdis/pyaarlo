@@ -64,8 +64,12 @@ def test_concurrent_starts_wait_for_the_current_source(camera, cached, method, u
 def test_failed_start_can_retry_without_reusing_cached_source(camera, failure):
     camera._stream_url = "rtsps://example.invalid/expired"
     camera._arlo.be.post.side_effect = [failure, {"url": "rtsp://example.invalid/retry"}]
-    with pytest.raises((RuntimeError, KeyError)):
-        camera.get_stream()
+    if isinstance(failure, Exception):
+        with pytest.raises(RuntimeError):
+            camera.get_stream()
+    else:
+        # Fork: an answer without a url is logged and returns None (was KeyError).
+        assert camera.get_stream() is None
     assert not camera.has_local_user("streaming")
     assert camera.get_stream() == "rtsps://example.invalid/retry"
     assert camera._arlo.be.post.call_count == 2

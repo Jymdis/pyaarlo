@@ -413,8 +413,14 @@ class ArloCamera(ArloChildDevice):
         stream_url = None
         try:
             response = self._arlo.be.post(STREAM_START_PATH, body, headers=headers)
-            if response is not None:
+            if isinstance(response, dict) and response.get("url"):
                 stream_url = response["url"].replace("rtsp://", "rtsps://")
+            elif response is not None:
+                # Fork: Arlo said yes but gave no URL; name the keys, not values.
+                keys = sorted(response) if isinstance(response, dict) else type(response).__name__
+                self._arlo.warning(f"{self.name}: startUserStream answered without a url (keys={keys})")
+            else:
+                self._arlo.warning(f"{self.name}: startUserStream failed (reason logged above)")
         finally:
             with self._lock:
                 self._stream_url = stream_url
