@@ -169,3 +169,17 @@ def _start_locked(cam):
     finally:
         for p in patches:
             p.stop()
+
+
+class TestSuccessFalseNamesThePath(TestCase):
+    def test_success_false_names_method_and_path_not_values(self):
+        body = {"success": False,
+                "data": {"error": "2059", "message": "Device is offline.",
+                         "reason": "Device is offline.", "url": "https://x/" + SECRET}}
+        backend = backend_for(JsonResponse(200, body))
+        self.assertEqual(
+            backend._request_tuple("/hmsweb/users/devices/notify/BASE123?x=" + SECRET,
+                                   method="POST"), (500, None))
+        self.assertEqual(backend._arlo.warnings, [
+            "error in response to POST /hmsweb/users/devices/notify/BASE123"
+            " (error=2059, message=Device is offline., reason=Device is offline.)"])

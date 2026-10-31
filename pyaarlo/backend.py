@@ -431,7 +431,7 @@ class ArloBackEnd(object):
                 # success, but no data so fake empty data
                 return 200, {}
             else:
-                self._arlo.warning("error in response=" + str(body))
+                self._arlo.warning(f"error in response to {method} {path.split('?')[0]}{_error_summary(body)}")
         else:
             self._arlo.warning(f"request {method} {path.split('?')[0]}: unexpected response without success or meta")
 
